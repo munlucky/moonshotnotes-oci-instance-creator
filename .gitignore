@@ -1,0 +1,17 @@
+.oci-instance-creator.env
+.env
+.env.*
+.oci/
+.venv/
+.uv-cache/
+logs/
+*.log
+*.pem
+*.key
+*.p8
+*.pub
+.claude/
+.moonshot-state/
+node_modules/
+oci-instance.log
+.oci-instance-created

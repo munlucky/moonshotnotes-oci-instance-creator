@@ -1,0 +1,83 @@
+name: OCI Free Tier Instance Creator
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # 5분마다 실행
+  workflow_dispatch:
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Setup OCI Config
+        run: |
+          mkdir -p ~/.oci
+
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=ap-chuncheon-1
+          key_file=~/.oci/key.pem
+          EOF
+
+          echo '${{ secrets.OCI_KEY }}' > ~/.oci/key.pem
+          chmod 600 ~/.oci/config ~/.oci/key.pem
+
+      - name: Create SSH Key File
+        run: echo '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
+
+      - name: Try to Launch Instance
+        id: launch
+        run: |
+          echo "🚀 Attempting to create instance at $(date)"
+
+          RESULT=$(oci compute instance launch \
+            --compartment-id "${{ secrets.OCI_TENANCY }}" \
+            --availability-domain "qibq:AP-CHUNCHEON-1-AD-1" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus": 4, "memoryInGBs": 24}' \
+            --subnet-id "${{ secrets.OCI_SUBNET }}" \
+            --image-id "${{ secrets.OCI_IMAGE }}" \
+            --assign-public-ip true \
+            --boot-volume-size-in-gbs 100 \
+            --ssh-authorized-keys-file /tmp/ssh_key.pub \
+            --display-name "AIew-instance" \
+            2>&1) || true
+
+          echo "$RESULT"
+
+          if echo "$RESULT" | grep -q "ocid1.instance"; then
+            echo "============================================"
+            echo "✅ SUCCESS! Instance created!"
+            echo "============================================"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Failed - Out of capacity, will retry in 5 minutes"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Success Notification
+        if: steps.launch.outputs.success == 'true'
+        run: |
+          echo "🎉 Instance created successfully!"
+          echo ""
+          echo "⚠️  IMPORTANT: Go disable this workflow now!"
+          echo "    Repository → Actions → ... → Disable workflow"
+
+      - name: Create Issue on Success
+        if: steps.launch.outputs.success == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🎉 OCI 인스턴스 생성 성공!',
+              body: `인스턴스가 생성되었습니다!\n\n시간: ${new Date().toISOString()}\n\n**지금 바로 워크플로우를 비활성화하세요!**`
+            })
