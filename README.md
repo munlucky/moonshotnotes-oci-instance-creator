@@ -6,6 +6,7 @@ Oracle Cloud Always Free A1 Flex 인스턴스를 CLI로 반복 생성하는 자�
 
 - 기본 `60초 + 0~10초 jitter` 간격으로 생성 시도
 - `429 TooManyRequests` 발생 시에만 `180 -> 207 -> 238 -> 273 -> 314 -> 360초` backoff
+- 429가 아닌 응답이 3회 연속 나오면 15초씩 낮추며 429가 덜 뜨는 안정 텀 탐색
 - `Out of host capacity` / `500 InternalError`는 A1 자리 부족으로 보고 계속 재시도
 - 기존 인스턴스 조회는 기본 20회마다 1번만 수행해서 불필요한 API 요청 최소화
 - `1 OCPU / 6GB`로 먼저 생성한 뒤 `2/12 -> 4/24` 순서로 resize 가능
@@ -309,7 +310,7 @@ MIN_INTERVAL_SECONDS="60"
 MAX_INTERVAL_SECONDS="360"
 RATE_LIMIT_MULTIPLIER="1.15"
 DECAY_AFTER_NON_429="3"
-DECAY_SECONDS="9999"
+DECAY_SECONDS="15"
 EXISTING_CHECK_EVERY_ATTEMPTS="20"
 MAX_ATTEMPTS="0"
 
