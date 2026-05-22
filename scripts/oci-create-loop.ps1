@@ -161,7 +161,41 @@ $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = Get-ConfigValue "OCI_CLI_SUPPRE
 function Write-Log {
     param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
-    Add-Content -LiteralPath $logFile -Value "${timestamp}: $Message"
+    Add-LogContent "${timestamp}: $Message"
+}
+
+function Add-LogContent {
+    param([string]$Value)
+
+    $directory = Split-Path -Parent $logFile
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            try {
+                $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::UTF8)
+                try {
+                    $writer.WriteLine($Value)
+                } finally {
+                    $writer.Dispose()
+                }
+            } finally {
+                if ($stream) {
+                    $stream.Dispose()
+                }
+            }
+            return
+        } catch {
+            if ($attempt -eq 5) {
+                Write-Warning "Log write failed: $($_.Exception.Message)"
+                return
+            }
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+    }
 }
 
 function Get-RegionConfigKey {
@@ -623,15 +657,15 @@ function Invoke-UpgradeAttempt {
 
         if ($result.ExitCode -eq 0) {
             Write-Log "Upgrade request succeeded: $instanceDisplayName"
-            Add-Content -LiteralPath $logFile -Value $result.Text
+            Add-LogContent $result.Text
             Test-TargetReached -WriteSuccessFlag | Out-Null
             return 0
         }
 
         $resultText = $result.Text
         Write-Log "Upgrade failed (exit code: $($result.ExitCode))"
-        Add-Content -LiteralPath $logFile -Value $resultText
-        Add-Content -LiteralPath $logFile -Value "---"
+        Add-LogContent $resultText
+        Add-LogContent "---"
         if ($resultText -match "TooManyRequests|`"status`": 429|status': 429") {
             return 2
         }
@@ -721,7 +755,7 @@ function Invoke-CreateAttempt {
 
         if ($result.ExitCode -eq 0 -and ($result.Text -match "ocid1.instance")) {
             Write-Log "Create request succeeded: $createInstanceName"
-            Add-Content -LiteralPath $logFile -Value $result.Text
+            Add-LogContent $result.Text
             $createdInstances = @(Get-TargetInstances)
             if ($createdInstances.Count -ge $targetInstanceCount -and $upgradeAfterCreate) {
                 $primaryInstance = Get-PrimaryTargetInstance -ExistingInstances $createdInstances
@@ -734,8 +768,8 @@ function Invoke-CreateAttempt {
 
         $resultText = $result.Text
         Write-Log "Failed (exit code: $($result.ExitCode))"
-        Add-Content -LiteralPath $logFile -Value $resultText
-        Add-Content -LiteralPath $logFile -Value "---"
+        Add-LogContent $resultText
+        Add-LogContent "---"
         if ($resultText -match "TooManyRequests|`"status`": 429|status': 429") {
             return 2
         }
