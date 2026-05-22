@@ -62,8 +62,8 @@ function Require-ConfigValue {
 $oci = Get-ConfigValue "OCI_CLI_BIN" (Join-Path $repoRoot ".venv\Scripts\oci.exe")
 $ociConfig = Get-ConfigValue "OCI_CONFIG_FILE" (Join-Path $HOME ".oci\config")
 $ociProfile = Get-ConfigValue "OCI_PROFILE" "DEFAULT"
-$ociConnectionTimeoutSeconds = [int](Get-ConfigValue "OCI_CONNECTION_TIMEOUT_SECONDS" "30")
-$ociReadTimeoutSeconds = [int](Get-ConfigValue "OCI_READ_TIMEOUT_SECONDS" "180")
+$ociConnectionTimeoutSeconds = [int](Get-ConfigValue "OCI_CONNECTION_TIMEOUT_SECONDS" "120")
+$ociReadTimeoutSeconds = [int](Get-ConfigValue "OCI_READ_TIMEOUT_SECONDS" "240")
 $logFile = Get-ConfigValue "LOG_FILE" (Join-Path $HOME "oci-instance.log")
 $successFlag = Get-ConfigValue "SUCCESS_FLAG" (Join-Path $HOME ".oci-instance-created")
 $intervalSeconds = [int](Get-ConfigValue "INTERVAL_SECONDS" "60")
