@@ -67,16 +67,18 @@ $ociReadTimeoutSeconds = [int](Get-ConfigValue "OCI_READ_TIMEOUT_SECONDS" "240")
 $logFile = Get-ConfigValue "LOG_FILE" (Join-Path $HOME "oci-instance.log")
 $successFlag = Get-ConfigValue "SUCCESS_FLAG" (Join-Path $HOME ".oci-instance-created")
 $intervalSeconds = [int](Get-ConfigValue "INTERVAL_SECONDS" "60")
-$rateLimitBackoffSeconds = [int](Get-ConfigValue "RATE_LIMIT_BACKOFF_SECONDS" "180")
+$rateLimitBackoffSeconds = [int](Get-ConfigValue "RATE_LIMIT_BACKOFF_SECONDS" "120")
 $jitterSeconds = [int](Get-ConfigValue "JITTER_SECONDS" "10")
 $throttleStateFile = Get-ConfigValue "THROTTLE_STATE_FILE" (Join-Path $HOME ".oci-instance-throttle.json")
-$minIntervalSeconds = [int](Get-ConfigValue "MIN_INTERVAL_SECONDS" $intervalSeconds.ToString())
+$minIntervalSeconds = [int](Get-ConfigValue "MIN_INTERVAL_SECONDS" "85")
 $maxIntervalSeconds = [int](Get-ConfigValue "MAX_INTERVAL_SECONDS" "360")
 $rateLimitMultiplier = [double](Get-ConfigValue "RATE_LIMIT_MULTIPLIER" "1.15")
 $decayAfterNon429 = [int](Get-ConfigValue "DECAY_AFTER_NON_429" "3")
 $decaySeconds = [int](Get-ConfigValue "DECAY_SECONDS" "15")
+$proactiveCooldownAfterMinAttempts = [int](Get-ConfigValue "PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS" "25")
+$proactiveCooldownIntervalSeconds = [int](Get-ConfigValue "PROACTIVE_COOLDOWN_INTERVAL_SECONDS" $rateLimitBackoffSeconds.ToString())
 $maxAttempts = [int](Get-ConfigValue "MAX_ATTEMPTS" "0")
-$existingCheckEveryAttempts = [int](Get-ConfigValue "EXISTING_CHECK_EVERY_ATTEMPTS" "20")
+$existingCheckEveryAttempts = [int](Get-ConfigValue "EXISTING_CHECK_EVERY_ATTEMPTS" "0")
 $defaultRegion = Get-ConfigValue "DEFAULT_REGION" ""
 $regionRotationRaw = Get-ConfigValue "REGION_ROTATION" ""
 $regionRotation = @()
@@ -138,8 +140,16 @@ if ($upgradeAfterCreate -and $upgradeSteps.Count -lt 1) {
     throw "UPGRADE_AFTER_CREATE requires at least one upgrade target"
 }
 
-if ($existingCheckEveryAttempts -lt 1) {
-    throw "EXISTING_CHECK_EVERY_ATTEMPTS must be at least 1"
+if ($existingCheckEveryAttempts -lt 0) {
+    throw "EXISTING_CHECK_EVERY_ATTEMPTS must be 0 or greater"
+}
+
+if ($proactiveCooldownAfterMinAttempts -lt 0) {
+    throw "PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS must be 0 or greater"
+}
+
+if ($proactiveCooldownIntervalSeconds -lt $minIntervalSeconds) {
+    throw "PROACTIVE_COOLDOWN_INTERVAL_SECONDS must be at least MIN_INTERVAL_SECONDS"
 }
 
 Require-ConfigValue "OCI_CLI_BIN" $oci
@@ -376,6 +386,8 @@ function Read-ThrottleState {
             return [pscustomobject]@{
                 CurrentIntervalSeconds = $current
                 ConsecutiveNon429 = [int]$state.ConsecutiveNon429
+                ConsecutiveMinIntervalAttempts = if ($state.PSObject.Properties["ConsecutiveMinIntervalAttempts"]) { [int]$state.ConsecutiveMinIntervalAttempts } else { 0 }
+                RecoveringFrom429 = if ($state.PSObject.Properties["RecoveringFrom429"]) { [bool]$state.RecoveringFrom429 } else { $false }
             }
         } catch {
             Write-Log "Throttle state unreadable. Resetting: $($_.Exception.Message)"
@@ -385,6 +397,8 @@ function Read-ThrottleState {
     return [pscustomobject]@{
         CurrentIntervalSeconds = $intervalSeconds
         ConsecutiveNon429 = 0
+        ConsecutiveMinIntervalAttempts = 0
+        RecoveringFrom429 = $false
     }
 }
 
@@ -407,23 +421,54 @@ function Get-AdaptiveSleepSeconds {
 
     $current = [int]$State.CurrentIntervalSeconds
     $non429 = [int]$State.ConsecutiveNon429
+    $minIntervalAttempts = if ($State.PSObject.Properties["ConsecutiveMinIntervalAttempts"]) { [int]$State.ConsecutiveMinIntervalAttempts } else { 0 }
+    $recoveringFrom429 = if ($State.PSObject.Properties["RecoveringFrom429"]) { [bool]$State.RecoveringFrom429 } else { $false }
+    $wasAtMinInterval = $current -le $minIntervalSeconds
 
     if ($ResultCode -eq 2) {
         $current = [Math]::Max($rateLimitBackoffSeconds, [Math]::Ceiling($current * $rateLimitMultiplier))
         $current = [Math]::Min($current, $maxIntervalSeconds)
         $non429 = 0
+        $minIntervalAttempts = 0
+        $recoveringFrom429 = $true
         Write-Log "429 detected. Increasing interval to $current seconds."
     } elseif ($ResultCode -eq 1) {
-        $non429++
-        if ($decayAfterNon429 -gt 0 -and $non429 -ge $decayAfterNon429) {
-            $current = [Math]::Max($minIntervalSeconds, $current - $decaySeconds)
+        if ($recoveringFrom429) {
+            $current = $minIntervalSeconds
             $non429 = 0
-            Write-Log "No 429 for $decayAfterNon429 attempts. Decreasing interval to $current seconds."
+            $minIntervalAttempts = 0
+            $recoveringFrom429 = $false
+            Write-Log "429 recovery succeeded. Returning interval to $current seconds."
+        } else {
+            if ($wasAtMinInterval) {
+                $minIntervalAttempts++
+            } else {
+                $minIntervalAttempts = 0
+            }
+            $non429++
+            if ($decayAfterNon429 -gt 0 -and $non429 -ge $decayAfterNon429) {
+                $current = [Math]::Max($minIntervalSeconds, $current - $decaySeconds)
+                $non429 = 0
+                Write-Log "No 429 for $decayAfterNon429 attempts. Decreasing interval to $current seconds."
+            }
         }
+    } elseif ($ResultCode -eq 3 -and $wasAtMinInterval) {
+        $minIntervalAttempts++
+    } elseif (-not $wasAtMinInterval) {
+        $minIntervalAttempts = 0
+    }
+
+    if ($proactiveCooldownAfterMinAttempts -gt 0 -and $minIntervalAttempts -ge $proactiveCooldownAfterMinAttempts) {
+        $current = [Math]::Min([Math]::Max($proactiveCooldownIntervalSeconds, $current), $maxIntervalSeconds)
+        $non429 = 0
+        $minIntervalAttempts = 0
+        Write-Log "Proactive cooldown after $proactiveCooldownAfterMinAttempts min-interval attempts. Raising interval to $current seconds."
     }
 
     $State.CurrentIntervalSeconds = $current
     $State.ConsecutiveNon429 = $non429
+    $State.ConsecutiveMinIntervalAttempts = $minIntervalAttempts
+    $State.RecoveringFrom429 = $recoveringFrom429
     Write-ThrottleState $State
 
     $sleepSeconds = $current
@@ -441,6 +486,10 @@ function Should-CheckExistingInstances {
 
     if ($script:attempt -le 1) {
         return $true
+    }
+
+    if ($existingCheckEveryAttempts -eq 0) {
+        return $false
     }
 
     return ((($script:attempt - 1) % $existingCheckEveryAttempts) -eq 0)

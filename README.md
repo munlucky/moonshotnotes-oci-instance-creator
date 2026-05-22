@@ -4,11 +4,11 @@ Oracle Cloud Always Free A1 Flex 인스턴스를 CLI로 반복 생성하는 자�
 
 핵심 동작:
 
-- 기본 `60초 + 0~10초 jitter` 간격으로 생성 시도
-- `429 TooManyRequests` 발생 시에만 `180 -> 207 -> 238 -> 273 -> 314 -> 360초` backoff
-- 429가 아닌 응답이 3회 연속 나오면 15초씩 낮추며 429가 덜 뜨는 안정 텀 탐색
+- 기본 하한 `85초 + 0~10초 jitter` 간격으로 생성 시도
+- `429 TooManyRequests` 발생 시 `120초` 회복 sleep을 주고, 다음 non-429 응답 후 바로 `85초` 하한으로 복귀
+- `85초` 하한에서 25회 누적 시도하면 429 전에 선제적으로 `120초` 쿨다운
 - `Out of host capacity` / `500 InternalError`는 A1 자리 부족으로 보고 계속 재시도
-- 기존 인스턴스 조회는 기본 20회마다 1번만 수행해서 불필요한 API 요청 최소화
+- 기존 인스턴스 조회는 시작 시 1회만 수행하고 이후 반복 조회는 기본 비활성화
 - `1 OCPU / 6GB`로 먼저 생성한 뒤 `2/12 -> 4/24` 순서로 resize 가능
 - 성공하면 success flag를 만들고 PM2가 다시 실행하지 않도록 정상 종료
 
@@ -306,14 +306,16 @@ UPGRADE_OCPUS="4"
 UPGRADE_MEMORY_GB="24"
 
 INTERVAL_SECONDS="60"
-RATE_LIMIT_BACKOFF_SECONDS="180"
+RATE_LIMIT_BACKOFF_SECONDS="120"
 JITTER_SECONDS="10"
-MIN_INTERVAL_SECONDS="60"
+MIN_INTERVAL_SECONDS="85"
 MAX_INTERVAL_SECONDS="360"
 RATE_LIMIT_MULTIPLIER="1.15"
 DECAY_AFTER_NON_429="3"
 DECAY_SECONDS="15"
-EXISTING_CHECK_EVERY_ATTEMPTS="20"
+PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS="25"
+PROACTIVE_COOLDOWN_INTERVAL_SECONDS="120"
+EXISTING_CHECK_EVERY_ATTEMPTS="0"
 MAX_ATTEMPTS="0"
 
 LOG_FILE="$HOME/oci-instance.log"

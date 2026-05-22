@@ -61,14 +61,16 @@ UPGRADE_OCPUS="${UPGRADE_OCPUS:-$OCPUS}"
 UPGRADE_MEMORY_GB="${UPGRADE_MEMORY_GB:-$MEMORY_GB}"
 
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
-RATE_LIMIT_BACKOFF_SECONDS="${RATE_LIMIT_BACKOFF_SECONDS:-180}"
+RATE_LIMIT_BACKOFF_SECONDS="${RATE_LIMIT_BACKOFF_SECONDS:-120}"
 JITTER_SECONDS="${JITTER_SECONDS:-10}"
-MIN_INTERVAL_SECONDS="${MIN_INTERVAL_SECONDS:-$INTERVAL_SECONDS}"
+MIN_INTERVAL_SECONDS="${MIN_INTERVAL_SECONDS:-85}"
 MAX_INTERVAL_SECONDS="${MAX_INTERVAL_SECONDS:-360}"
 RATE_LIMIT_MULTIPLIER="${RATE_LIMIT_MULTIPLIER:-1.15}"
 DECAY_AFTER_NON_429="${DECAY_AFTER_NON_429:-3}"
 DECAY_SECONDS="${DECAY_SECONDS:-15}"
-EXISTING_CHECK_EVERY_ATTEMPTS="${EXISTING_CHECK_EVERY_ATTEMPTS:-20}"
+PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS="${PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS:-25}"
+PROACTIVE_COOLDOWN_INTERVAL_SECONDS="${PROACTIVE_COOLDOWN_INTERVAL_SECONDS:-$RATE_LIMIT_BACKOFF_SECONDS}"
+EXISTING_CHECK_EVERY_ATTEMPTS="${EXISTING_CHECK_EVERY_ATTEMPTS:-0}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-0}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-0}"
 
@@ -149,9 +151,23 @@ require_number "TARGET_INSTANCE_COUNT" "$TARGET_INSTANCE_COUNT"
 require_number "INTERVAL_SECONDS" "$INTERVAL_SECONDS"
 require_number "MAX_ATTEMPTS" "$MAX_ATTEMPTS"
 require_number "EXISTING_CHECK_EVERY_ATTEMPTS" "$EXISTING_CHECK_EVERY_ATTEMPTS"
+require_number "PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS" "$PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS"
+require_number "PROACTIVE_COOLDOWN_INTERVAL_SECONDS" "$PROACTIVE_COOLDOWN_INTERVAL_SECONDS"
 
 if [ "$TARGET_INSTANCE_COUNT" -lt 1 ]; then
     die_config "TARGET_INSTANCE_COUNT must be at least 1"
+fi
+
+if [ "$EXISTING_CHECK_EVERY_ATTEMPTS" -lt 0 ]; then
+    die_config "EXISTING_CHECK_EVERY_ATTEMPTS must be 0 or greater"
+fi
+
+if [ "$PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS" -lt 0 ]; then
+    die_config "PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS must be 0 or greater"
+fi
+
+if [ "$PROACTIVE_COOLDOWN_INTERVAL_SECONDS" -lt "$MIN_INTERVAL_SECONDS" ]; then
+    die_config "PROACTIVE_COOLDOWN_INTERVAL_SECONDS must be at least MIN_INTERVAL_SECONDS"
 fi
 
 if is_true "$UPGRADE_AFTER_CREATE" && [ "$TARGET_INSTANCE_COUNT" -ne 1 ]; then
@@ -494,7 +510,7 @@ invoke_create_attempt() {
     should_check=0
     if [ "$ATTEMPT" -eq 1 ] || [ "$VALIDATE_ONLY" = "1" ]; then
         should_check=1
-    elif [ $(((ATTEMPT - 1) % EXISTING_CHECK_EVERY_ATTEMPTS)) -eq 0 ]; then
+    elif [ "$EXISTING_CHECK_EVERY_ATTEMPTS" -gt 0 ] && [ $(((ATTEMPT - 1) % EXISTING_CHECK_EVERY_ATTEMPTS)) -eq 0 ]; then
         should_check=1
     fi
 
@@ -591,21 +607,25 @@ try:
     data = json.load(open(path, encoding="utf-8"))
     current = int(data.get("CurrentIntervalSeconds", default))
     non429 = int(data.get("ConsecutiveNon429", 0))
+    min_attempts = int(data.get("ConsecutiveMinIntervalAttempts", 0))
+    recovering = 1 if data.get("RecoveringFrom429", False) else 0
 except Exception:
-    current, non429 = int(default), 0
+    current, non429, min_attempts, recovering = int(default), 0, 0, 0
 current = max(int(minimum), min(current, int(maximum)))
-print(current, non429)
+print(current, non429, min_attempts, recovering)
 ' "$INTERVAL_SECONDS" "$MIN_INTERVAL_SECONDS" "$MAX_INTERVAL_SECONDS" "$THROTTLE_STATE_FILE"
     else
-        printf '%s 0\n' "$INTERVAL_SECONDS"
+        printf '%s 0 0 0\n' "$INTERVAL_SECONDS"
     fi
 }
 
 write_throttle_state() {
     current="$1"
     non429="$2"
+    min_attempts="$3"
+    recovering="$4"
     mkdir -p "$(dirname "$THROTTLE_STATE_FILE")" 2>/dev/null || true
-    printf '{"CurrentIntervalSeconds":%s,"ConsecutiveNon429":%s}\n' "$current" "$non429" > "$THROTTLE_STATE_FILE"
+    printf '{"CurrentIntervalSeconds":%s,"ConsecutiveNon429":%s,"ConsecutiveMinIntervalAttempts":%s,"RecoveringFrom429":%s}\n' "$current" "$non429" "$min_attempts" "$recovering" > "$THROTTLE_STATE_FILE"
 }
 
 adaptive_sleep_seconds() {
@@ -614,6 +634,10 @@ adaptive_sleep_seconds() {
     set -- $state
     current="$1"
     non429="$2"
+    min_attempts="$3"
+    recovering="$4"
+    was_at_min=0
+    [ "$current" -le "$MIN_INTERVAL_SECONDS" ] && was_at_min=1
 
     if [ "$result_code" -eq 2 ]; then
         multiplied="$(awk -v c="$current" -v m="$RATE_LIMIT_MULTIPLIER" 'BEGIN { printf "%d", int(c * m + 0.999999) }')"
@@ -621,18 +645,45 @@ adaptive_sleep_seconds() {
         [ "$current" -lt "$RATE_LIMIT_BACKOFF_SECONDS" ] && current="$RATE_LIMIT_BACKOFF_SECONDS"
         [ "$current" -gt "$MAX_INTERVAL_SECONDS" ] && current="$MAX_INTERVAL_SECONDS"
         non429=0
+        min_attempts=0
+        recovering=1
     elif [ "$result_code" -eq 3 ]; then
-        :
+        if [ "$was_at_min" -eq 1 ]; then
+            min_attempts=$((min_attempts + 1))
+        elif [ "$recovering" -ne 1 ]; then
+            min_attempts=0
+        fi
     else
-        non429=$((non429 + 1))
-        if [ "$non429" -ge "$DECAY_AFTER_NON_429" ]; then
-            current=$((current - DECAY_SECONDS))
-            [ "$current" -lt "$MIN_INTERVAL_SECONDS" ] && current="$MIN_INTERVAL_SECONDS"
+        if [ "$recovering" -eq 1 ]; then
+            current="$MIN_INTERVAL_SECONDS"
             non429=0
+            min_attempts=0
+            recovering=0
+            log "429 recovery succeeded. Returning interval to $current seconds."
+        else
+            if [ "$was_at_min" -eq 1 ]; then
+                min_attempts=$((min_attempts + 1))
+            else
+                min_attempts=0
+            fi
+            non429=$((non429 + 1))
+            if [ "$DECAY_AFTER_NON_429" -gt 0 ] && [ "$non429" -ge "$DECAY_AFTER_NON_429" ]; then
+                current=$((current - DECAY_SECONDS))
+                [ "$current" -lt "$MIN_INTERVAL_SECONDS" ] && current="$MIN_INTERVAL_SECONDS"
+                non429=0
+            fi
         fi
     fi
 
-    write_throttle_state "$current" "$non429"
+    if [ "$PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS" -gt 0 ] && [ "$min_attempts" -ge "$PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS" ]; then
+        [ "$current" -lt "$PROACTIVE_COOLDOWN_INTERVAL_SECONDS" ] && current="$PROACTIVE_COOLDOWN_INTERVAL_SECONDS"
+        [ "$current" -gt "$MAX_INTERVAL_SECONDS" ] && current="$MAX_INTERVAL_SECONDS"
+        non429=0
+        min_attempts=0
+        log "Proactive cooldown after $PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS min-interval attempts. Raising interval to $current seconds."
+    fi
+
+    write_throttle_state "$current" "$non429" "$min_attempts" "$recovering"
     sleep_seconds="$current"
     if [ "$JITTER_SECONDS" -gt 0 ]; then
         jitter=$((RANDOM % (JITTER_SECONDS + 1)))
