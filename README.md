@@ -4,11 +4,15 @@ Oracle Cloud Always Free A1 Flex 인스턴스를 CLI로 반복 생성하는 자�
 
 핵심 동작:
 
-- 기본 하한 `85초 + 0~10초 jitter` 간격으로 생성 시도
-- `429 TooManyRequests` 발생 시 `120초` 회복 sleep을 주고, 다음 non-429 응답 후 바로 `85초` 하한으로 복귀
-- `85초` 하한에서 25회 누적 시도하면 429 전에 선제적으로 `120초` 쿨다운
+- 기본 하한 `80초 + 0~10초 jitter` 간격으로 생성 시도
+- `429 TooManyRequests` 발생 시 `120초` 회복 sleep을 주고, 다음 non-429 응답 후 바로 `80초` 하한으로 복귀
+- `80초` 하한에서 25회 누적 시도하면 429 전에 선제적으로 `120초` 쿨다운
 - `Out of host capacity` / `500 InternalError`는 A1 자리 부족으로 보고 계속 재시도
-- 기존 인스턴스 조회는 시작 시 1회만 수행하고 이후 반복 조회는 기본 비활성화
+- 기존 인스턴스 조회는 시작 시 1회만 수행하고, 생성 성공 후에는 생성된 instance id로 upgrade만 재시도
+- 목표 수보다 많은 동일 prefix 인스턴스가 감지되면 추가 생성/업그레이드를 멈춰 중복 과금을 방지
+- `CREATE_IF_MISSING=false`로 전환하면 새 생성 없이 기존 인스턴스 upgrade만 수행
+- Windows/macOS/Linux 모두 단일 루프 lock을 잡아 PM2 중복 프로세스의 동시 생성 요청을 차단
+- `launch` 요청이 timeout처럼 성공 여부가 불명확하게 끝나면 다음 루프에서 강제로 기존 인스턴스를 재조회
 - `1 OCPU / 6GB`로 먼저 생성한 뒤 `2/12 -> 4/24` 순서로 resize 가능
 - 성공하면 success flag를 만들고 PM2가 다시 실행하지 않도록 정상 종료
 
@@ -37,6 +41,7 @@ UPGRADE_STEPS="2:12,4:24"
 | --- | --- | --- |
 | `Out of host capacity` / `InternalError` / `500` | 해당 리전에 빈 A1 자리가 없음 | 정상 실패로 보고 계속 재시도 |
 | `TooManyRequests` / `429` | OCI API 요청이 너무 잦음 | 429 전용 backoff 적용 |
+| `Conflict` / `409` / `currently being modified` | 생성/변경 직후 인스턴스가 아직 안정 상태가 아님 | `RUNNING`/`STOPPED` 상태가 될 때까지 upgrade 보류 후 재시도 |
 | `The connection to endpoint timed out` | OCI CLI 또는 Oracle endpoint 응답 지연 | 다음 루프에서 재시도 |
 | `NotAuthenticated` | OCI config, private key, fingerprint, region, 구독 문제 | 인증 설정부터 수정 |
 
@@ -283,14 +288,15 @@ IMAGE_OPERATING_SYSTEM_VERSION="24.04 Minimal aarch64"
 INSTANCE_NAME="instance-oci-a1"
 INSTANCE_NAME_PREFIX="instance-oci-a1"
 TARGET_INSTANCE_COUNT="1"
+CREATE_IF_MISSING="true"
 
 SSH_KEY_FILE="$HOME/.ssh/id_rsa.pub"
 SSH_PUBLIC_KEY=""
 
 OCI_CONFIG_FILE="$HOME/.oci/config"
 OCI_PROFILE="DEFAULT"
-OCI_CONNECTION_TIMEOUT_SECONDS="120"
-OCI_READ_TIMEOUT_SECONDS="240"
+OCI_CONNECTION_TIMEOUT_SECONDS="240"
+OCI_READ_TIMEOUT_SECONDS="480"
 DEFAULT_REGION="ap-chuncheon-1"
 REGION_ROTATION="ap-chuncheon-1"
 
@@ -308,7 +314,7 @@ UPGRADE_MEMORY_GB="24"
 INTERVAL_SECONDS="60"
 RATE_LIMIT_BACKOFF_SECONDS="120"
 JITTER_SECONDS="10"
-MIN_INTERVAL_SECONDS="85"
+MIN_INTERVAL_SECONDS="80"
 MAX_INTERVAL_SECONDS="360"
 RATE_LIMIT_MULTIPLIER="1.15"
 DECAY_AFTER_NON_429="3"

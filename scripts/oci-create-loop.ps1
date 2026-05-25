@@ -62,15 +62,15 @@ function Require-ConfigValue {
 $oci = Get-ConfigValue "OCI_CLI_BIN" (Join-Path $repoRoot ".venv\Scripts\oci.exe")
 $ociConfig = Get-ConfigValue "OCI_CONFIG_FILE" (Join-Path $HOME ".oci\config")
 $ociProfile = Get-ConfigValue "OCI_PROFILE" "DEFAULT"
-$ociConnectionTimeoutSeconds = [int](Get-ConfigValue "OCI_CONNECTION_TIMEOUT_SECONDS" "120")
-$ociReadTimeoutSeconds = [int](Get-ConfigValue "OCI_READ_TIMEOUT_SECONDS" "240")
+$ociConnectionTimeoutSeconds = [int](Get-ConfigValue "OCI_CONNECTION_TIMEOUT_SECONDS" "240")
+$ociReadTimeoutSeconds = [int](Get-ConfigValue "OCI_READ_TIMEOUT_SECONDS" "480")
 $logFile = Get-ConfigValue "LOG_FILE" (Join-Path $HOME "oci-instance.log")
 $successFlag = Get-ConfigValue "SUCCESS_FLAG" (Join-Path $HOME ".oci-instance-created")
 $intervalSeconds = [int](Get-ConfigValue "INTERVAL_SECONDS" "60")
 $rateLimitBackoffSeconds = [int](Get-ConfigValue "RATE_LIMIT_BACKOFF_SECONDS" "120")
 $jitterSeconds = [int](Get-ConfigValue "JITTER_SECONDS" "10")
 $throttleStateFile = Get-ConfigValue "THROTTLE_STATE_FILE" (Join-Path $HOME ".oci-instance-throttle.json")
-$minIntervalSeconds = [int](Get-ConfigValue "MIN_INTERVAL_SECONDS" "85")
+$minIntervalSeconds = [int](Get-ConfigValue "MIN_INTERVAL_SECONDS" "80")
 $maxIntervalSeconds = [int](Get-ConfigValue "MAX_INTERVAL_SECONDS" "360")
 $rateLimitMultiplier = [double](Get-ConfigValue "RATE_LIMIT_MULTIPLIER" "1.15")
 $decayAfterNon429 = [int](Get-ConfigValue "DECAY_AFTER_NON_429" "3")
@@ -93,6 +93,8 @@ $imageId = Get-ConfigValue "IMAGE_ID"
 $instanceName = Get-ConfigValue "INSTANCE_NAME" "oci-free-tier-a1"
 $instanceNamePrefix = Get-ConfigValue "INSTANCE_NAME_PREFIX" $instanceName
 $targetInstanceCount = [int](Get-ConfigValue "TARGET_INSTANCE_COUNT" "1")
+$createIfMissing = (Get-ConfigValue "CREATE_IF_MISSING" "true") -match '^(1|true|yes)$'
+$lockName = Get-ConfigValue "LOCK_NAME" ("Local\oci-instance-creator-" + ($instanceNamePrefix -replace '[^A-Za-z0-9_-]', '_'))
 $sshPublicKey = Get-ConfigValue "SSH_PUBLIC_KEY"
 $sshKeyFile = Get-ConfigValue "SSH_KEY_FILE" (Join-Path $HOME ".ssh\oci_key.pub")
 
@@ -488,6 +490,10 @@ function Should-CheckExistingInstances {
         return $true
     }
 
+    if ($script:forceNextExistingCheck) {
+        return $true
+    }
+
     if ($existingCheckEveryAttempts -eq 0) {
         return $false
     }
@@ -570,6 +576,43 @@ function Get-TargetInstances {
     return $instances
 }
 
+function Get-InstanceById {
+    param(
+        [string]$InstanceId,
+        [string]$Region,
+        [string]$RegionLabel
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) {
+        return $null
+    }
+
+    $result = Invoke-OciCommand -Region $Region -Arguments @(
+        "compute", "instance", "get",
+        "--instance-id", $InstanceId,
+        "--output", "json"
+    )
+
+    if ($result.ExitCode -ne 0) {
+        Write-Log "Pending instance lookup failed: region=$RegionLabel id=$InstanceId output=$($result.Text.Trim())"
+        return $null
+    }
+
+    try {
+        $parsed = $result.Text | ConvertFrom-Json
+        $instance = $parsed.data
+        if ($null -eq $instance) {
+            return $null
+        }
+        $instance | Add-Member -NotePropertyName "__region" -NotePropertyValue $Region -Force
+        $instance | Add-Member -NotePropertyName "__regionLabel" -NotePropertyValue $RegionLabel -Force
+        return $instance
+    } catch {
+        Write-Log "Pending instance lookup parse failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Get-ShapeConfigValue {
     param(
         [object]$Instance,
@@ -622,7 +665,7 @@ function Get-PrimaryTargetInstance {
 
     $exact = @($ExistingInstances | Where-Object { [string]$_.'display-name' -eq $instanceName })
     if ($exact.Count -gt 0) {
-        return $exact[0]
+        return @($exact | Sort-Object 'time-created')[0]
     }
 
     if ($ExistingInstances.Count -gt 0) {
@@ -654,6 +697,11 @@ function Test-TargetReached {
     }
 
     Write-Log "Target instance check: count=$count target=$targetInstanceCount instances=$names"
+    if ($count -gt $targetInstanceCount) {
+        Write-Log "Target instance overflow detected: count=$count target=$targetInstanceCount. Holding automation to avoid extra create/upgrade."
+        return $false
+    }
+
     if ($count -ge $targetInstanceCount -and @($instances | Where-Object { -not (Test-InstanceUpgraded -Instance $_) }).Count -eq 0) {
         if ($WriteSuccessFlag) {
             New-Item -ItemType File -Force -Path $successFlag | Out-Null
@@ -685,6 +733,12 @@ function Invoke-UpgradeAttempt {
     $currentMemoryGb = Get-ShapeConfigValue -Instance $Instance -Name "memory-in-gbs"
     $nextStep = Get-NextUpgradeStep -Instance $Instance
     $tempShapeConfigFile = $null
+    $lifecycleState = [string]$Instance.'lifecycle-state'
+
+    if ($lifecycleState -notin @("RUNNING", "STOPPED")) {
+        Write-Log "Upgrade deferred: region=$instanceRegionLabel name=$instanceDisplayName id=$instanceId lifecycleState=$lifecycleState"
+        return 1
+    }
 
     if ($null -eq $nextStep) {
         Test-TargetReached -WriteSuccessFlag | Out-Null
@@ -721,6 +775,10 @@ function Invoke-UpgradeAttempt {
         if ($resultText -match "timed out|timeout|RequestException") {
             return 3
         }
+        if ($resultText -match "`"status`": 409|status': 409|currently being modified|Conflict") {
+            Write-Log "Upgrade conflict is transient. Will retry after instance modification completes."
+            return 1
+        }
         return 1
     } finally {
         if ($tempShapeConfigFile -and (Test-Path -LiteralPath $tempShapeConfigFile)) {
@@ -735,9 +793,22 @@ function Invoke-CreateAttempt {
         return 0
     }
 
+    if ($upgradeAfterCreate -and -not [string]::IsNullOrWhiteSpace($script:pendingUpgradeInstanceId)) {
+        $pendingInstance = Get-InstanceById -InstanceId $script:pendingUpgradeInstanceId -Region $script:pendingUpgradeRegion -RegionLabel $script:pendingUpgradeRegionLabel
+        if ($null -ne $pendingInstance) {
+            return Invoke-UpgradeAttempt -Instance $pendingInstance
+        }
+
+        Write-Log "Pending upgrade instance disappeared. Falling back to target instance check."
+        $script:pendingUpgradeInstanceId = ""
+        $script:pendingUpgradeRegion = ""
+        $script:pendingUpgradeRegionLabel = ""
+    }
+
     $shouldCheckExisting = Should-CheckExistingInstances
     if ($shouldCheckExisting) {
         $existingInstances = @(Get-TargetInstances)
+        $script:forceNextExistingCheck = $false
     } else {
         $existingInstances = @()
         Write-Log "Skipping target instance check to reduce OCI API calls: attempt=$script:attempt nextCheckEvery=$existingCheckEveryAttempts"
@@ -749,9 +820,18 @@ function Invoke-CreateAttempt {
         return 0
     }
 
+    if ($shouldCheckExisting -and $existingInstances.Count -gt $targetInstanceCount) {
+        return 1
+    }
+
     if (-not $ValidateOnly -and $shouldCheckExisting -and $upgradeAfterCreate -and $existingInstances.Count -ge $targetInstanceCount) {
         $primaryInstance = Get-PrimaryTargetInstance -ExistingInstances $existingInstances
         return Invoke-UpgradeAttempt -Instance $primaryInstance
+    }
+
+    if (-not $createIfMissing) {
+        Write-Log "Create disabled by CREATE_IF_MISSING=false. Waiting for an existing target instance to upgrade."
+        return 1
     }
 
     $tempKeyFile = $null
@@ -805,13 +885,24 @@ function Invoke-CreateAttempt {
         if ($result.ExitCode -eq 0 -and ($result.Text -match "ocid1.instance")) {
             Write-Log "Create request succeeded: $createInstanceName"
             Add-LogContent $result.Text
-            $createdInstances = @(Get-TargetInstances)
-            if ($createdInstances.Count -ge $targetInstanceCount -and $upgradeAfterCreate) {
-                $primaryInstance = Get-PrimaryTargetInstance -ExistingInstances $createdInstances
-                Invoke-UpgradeAttempt -Instance $primaryInstance | Out-Null
-            } else {
-                Test-TargetReached -ExistingInstances $createdInstances -WriteSuccessFlag | Out-Null
+            try {
+                $createdPayload = $result.Text | ConvertFrom-Json
+                if ($null -ne $createdPayload.data -and -not [string]::IsNullOrWhiteSpace([string]$createdPayload.data.id)) {
+                    $script:pendingUpgradeInstanceId = [string]$createdPayload.data.id
+                    $script:pendingUpgradeRegion = $regionTarget.Region
+                    $script:pendingUpgradeRegionLabel = $regionTarget.Label
+                    $createdPayload.data | Add-Member -NotePropertyName "__region" -NotePropertyValue $regionTarget.Region -Force
+                    $createdPayload.data | Add-Member -NotePropertyName "__regionLabel" -NotePropertyValue $regionTarget.Label -Force
+                    if ($upgradeAfterCreate) {
+                        return Invoke-UpgradeAttempt -Instance $createdPayload.data
+                    }
+                }
+            } catch {
+                Write-Log "Create response parse failed. Falling back to target instance check: $($_.Exception.Message)"
             }
+
+            $createdInstances = @(Get-TargetInstances)
+            Test-TargetReached -ExistingInstances $createdInstances -WriteSuccessFlag | Out-Null
             return 0
         }
 
@@ -840,27 +931,50 @@ function Invoke-CreateAttempt {
 }
 
 $script:attempt = 1
+$script:pendingUpgradeInstanceId = ""
+$script:pendingUpgradeRegion = ""
+$script:pendingUpgradeRegionLabel = ""
+$script:forceNextExistingCheck = $false
 $throttleState = Read-ThrottleState
 Write-Log "Throttle state loaded: interval=$($throttleState.CurrentIntervalSeconds) consecutiveNon429=$($throttleState.ConsecutiveNon429)"
-while (-not (Test-Path -LiteralPath $successFlag)) {
-    if ($maxAttempts -gt 0 -and $script:attempt -gt $maxAttempts) {
-        Write-Output "Max attempts reached: $maxAttempts"
-        exit 1
+$script:loopMutex = [System.Threading.Mutex]::new($false, $lockName)
+$script:hasLoopLock = $script:loopMutex.WaitOne(0)
+if (-not $script:hasLoopLock) {
+    Write-Log "Another loop is already running. Skipping."
+    Write-Output "Another loop is already running. Skipping."
+    exit 0
+}
+
+try {
+    while (-not (Test-Path -LiteralPath $successFlag)) {
+        if ($maxAttempts -gt 0 -and $script:attempt -gt $maxAttempts) {
+            Write-Output "Max attempts reached: $maxAttempts"
+            exit 1
+        }
+
+        Write-Output "Attempt $script:attempt at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+        $resultCode = Invoke-CreateAttempt
+        if ($resultCode -eq 3) {
+            $script:forceNextExistingCheck = $true
+            Write-Log "Timeout result detected. Forcing target instance check before the next launch attempt."
+        }
+
+        if ($ValidateOnly -or $Once -or (Test-Path -LiteralPath $successFlag)) {
+            exit $resultCode
+        }
+
+        $sleepSeconds = Get-AdaptiveSleepSeconds -ResultCode $resultCode -State $throttleState
+        Write-Output "Sleeping $sleepSeconds seconds"
+        Write-Log "Sleeping $sleepSeconds seconds before next attempt."
+
+        $script:attempt++
+        Start-Sleep -Seconds $sleepSeconds
     }
-
-    Write-Output "Attempt $script:attempt at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
-    $resultCode = Invoke-CreateAttempt
-
-    if ($ValidateOnly -or $Once -or (Test-Path -LiteralPath $successFlag)) {
-        exit $resultCode
+} finally {
+    if ($script:hasLoopLock) {
+        $script:loopMutex.ReleaseMutex()
     }
-
-    $sleepSeconds = Get-AdaptiveSleepSeconds -ResultCode $resultCode -State $throttleState
-    Write-Output "Sleeping $sleepSeconds seconds"
-    Write-Log "Sleeping $sleepSeconds seconds before next attempt."
-
-    $script:attempt++
-    Start-Sleep -Seconds $sleepSeconds
+    $script:loopMutex.Dispose()
 }
 
 Write-Output "Success flag already exists: $successFlag"

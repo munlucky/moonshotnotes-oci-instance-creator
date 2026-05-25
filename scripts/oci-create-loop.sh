@@ -27,8 +27,8 @@ LOCK_DIR="${LOCK_DIR:-/tmp/oci-instance-creator-loop.lock}"
 OCI_CLI_BIN="${OCI_CLI_BIN:-}"
 OCI_CONFIG_FILE="${OCI_CONFIG_FILE:-$HOME/.oci/config}"
 OCI_PROFILE="${OCI_PROFILE:-DEFAULT}"
-OCI_CONNECTION_TIMEOUT_SECONDS="${OCI_CONNECTION_TIMEOUT_SECONDS:-120}"
-OCI_READ_TIMEOUT_SECONDS="${OCI_READ_TIMEOUT_SECONDS:-240}"
+OCI_CONNECTION_TIMEOUT_SECONDS="${OCI_CONNECTION_TIMEOUT_SECONDS:-240}"
+OCI_READ_TIMEOUT_SECONDS="${OCI_READ_TIMEOUT_SECONDS:-480}"
 OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING="${OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING:-True}"
 export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
 
@@ -44,6 +44,7 @@ IMAGE_OPERATING_SYSTEM_VERSION="${IMAGE_OPERATING_SYSTEM_VERSION:-24.04 Minimal 
 INSTANCE_NAME="${INSTANCE_NAME:-oci-free-tier-a1}"
 INSTANCE_NAME_PREFIX="${INSTANCE_NAME_PREFIX:-$INSTANCE_NAME}"
 TARGET_INSTANCE_COUNT="${TARGET_INSTANCE_COUNT:-1}"
+CREATE_IF_MISSING="${CREATE_IF_MISSING:-true}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SSH_KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/oci_key.pub}"
 
@@ -63,7 +64,7 @@ UPGRADE_MEMORY_GB="${UPGRADE_MEMORY_GB:-$MEMORY_GB}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
 RATE_LIMIT_BACKOFF_SECONDS="${RATE_LIMIT_BACKOFF_SECONDS:-120}"
 JITTER_SECONDS="${JITTER_SECONDS:-10}"
-MIN_INTERVAL_SECONDS="${MIN_INTERVAL_SECONDS:-85}"
+MIN_INTERVAL_SECONDS="${MIN_INTERVAL_SECONDS:-80}"
 MAX_INTERVAL_SECONDS="${MAX_INTERVAL_SECONDS:-360}"
 RATE_LIMIT_MULTIPLIER="${RATE_LIMIT_MULTIPLIER:-1.15}"
 DECAY_AFTER_NON_429="${DECAY_AFTER_NON_429:-3}"
@@ -79,9 +80,13 @@ LAST_INSTANCES_FILE=""
 LAST_INSTANCE_COUNT=0
 LAST_PRIMARY_ID=""
 LAST_PRIMARY_NAME=""
+LAST_PRIMARY_STATE=""
 LAST_PRIMARY_REGION=""
 LAST_PRIMARY_OCPUS="0"
 LAST_PRIMARY_MEMORY_GB="0"
+PENDING_UPGRADE_ID=""
+PENDING_UPGRADE_REGION=""
+FORCE_NEXT_EXISTING_CHECK=0
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -389,13 +394,14 @@ load_target_state() {
     LAST_INSTANCE_COUNT=0
     LAST_PRIMARY_ID=""
     LAST_PRIMARY_NAME=""
+    LAST_PRIMARY_STATE=""
     LAST_PRIMARY_REGION=""
     LAST_PRIMARY_OCPUS="0"
     LAST_PRIMARY_MEMORY_GB="0"
 
     if [ -s "$LAST_INSTANCES_FILE" ]; then
         LAST_INSTANCE_COUNT="$(wc -l < "$LAST_INSTANCES_FILE" | tr -d ' ')"
-        primary_line="$(awk -F '\t' -v exact="$INSTANCE_NAME" 'BEGIN{best=""} $2==exact{print; exit} best==""{best=$0} END{if(best!="") print best}' "$LAST_INSTANCES_FILE" | head -n 1)"
+        primary_line="$(sort -t '	' -k6,6 "$LAST_INSTANCES_FILE" | awk -F '\t' -v exact="$INSTANCE_NAME" 'BEGIN{best=""} $2==exact{print; exit} best==""{best=$0} END{if(best!="") print best}' | head -n 1)"
         if [ -n "$primary_line" ]; then
             OLD_IFS="$IFS"
             IFS='	'
@@ -403,6 +409,7 @@ load_target_state() {
             IFS="$OLD_IFS"
             LAST_PRIMARY_ID="${1:-}"
             LAST_PRIMARY_NAME="${2:-}"
+            LAST_PRIMARY_STATE="${3:-}"
             LAST_PRIMARY_OCPUS="${4:-0}"
             LAST_PRIMARY_MEMORY_GB="${5:-0}"
             LAST_PRIMARY_REGION="${7:-}"
@@ -412,6 +419,55 @@ load_target_state() {
     names="$(awk -F '\t' '{ printf "%s:%s:%socpu/%sgb%s", $2, $3, $4, $5, ORS }' "$LAST_INSTANCES_FILE" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
     [ -n "$names" ] || names="none"
     log "Target instance check: count=$LAST_INSTANCE_COUNT target=$TARGET_INSTANCE_COUNT instances=$names"
+}
+
+load_pending_instance_state() {
+    [ -n "$PENDING_UPGRADE_ID" ] || return 1
+
+    result="$(run_oci "$PENDING_UPGRADE_REGION" compute instance get --instance-id "$PENDING_UPGRADE_ID" --output json 2>>"$LOG_FILE")" || {
+        log "Pending instance lookup failed: region=${PENDING_UPGRADE_REGION:-default} id=$PENDING_UPGRADE_ID"
+        return 1
+    }
+
+    line="$(printf '%s' "$result" | "$PYTHON_BIN" -c '
+import json, sys
+region = sys.argv[1]
+try:
+    item = json.load(sys.stdin).get("data") or {}
+except Exception:
+    item = {}
+shape = item.get("shape-config") or {}
+print("\t".join([
+    item.get("id") or "",
+    item.get("display-name") or "",
+    item.get("lifecycle-state") or "",
+    str(shape.get("ocpus") or 0),
+    str(shape.get("memory-in-gbs") or shape.get("memoryInGBs") or 0),
+    item.get("time-created") or "",
+    region,
+]))
+' "$PENDING_UPGRADE_REGION")"
+
+    [ -n "$line" ] || return 1
+    LAST_INSTANCE_COUNT=1
+    OLD_IFS="$IFS"
+    IFS='	'
+    set -- $line
+    IFS="$OLD_IFS"
+    LAST_PRIMARY_ID="${1:-}"
+    LAST_PRIMARY_NAME="${2:-}"
+    LAST_PRIMARY_STATE="${3:-}"
+    LAST_PRIMARY_OCPUS="${4:-0}"
+    LAST_PRIMARY_MEMORY_GB="${5:-0}"
+    LAST_PRIMARY_REGION="${7:-}"
+}
+
+target_overflow() {
+    if [ "$LAST_INSTANCE_COUNT" -gt "$TARGET_INSTANCE_COUNT" ]; then
+        log "Target instance overflow detected: count=$LAST_INSTANCE_COUNT target=$TARGET_INSTANCE_COUNT. Holding automation to avoid extra create/upgrade."
+        return 0
+    fi
+    return 1
 }
 
 target_upgraded() {
@@ -450,6 +506,11 @@ classify_result() {
 
 invoke_upgrade_attempt() {
     [ -n "$LAST_PRIMARY_ID" ] || return 1
+    if [ "$LAST_PRIMARY_STATE" != "RUNNING" ] && [ "$LAST_PRIMARY_STATE" != "STOPPED" ]; then
+        log "Upgrade deferred: region=${LAST_PRIMARY_REGION:-default} name=$LAST_PRIMARY_NAME id=$LAST_PRIMARY_ID lifecycleState=$LAST_PRIMARY_STATE"
+        return 1
+    fi
+
     step="$(next_upgrade_step "$LAST_PRIMARY_OCPUS" "$LAST_PRIMARY_MEMORY_GB")"
     if [ -z "$step" ]; then
         load_target_state
@@ -507,8 +568,18 @@ invoke_create_attempt() {
         return 0
     fi
 
+    if is_true "$UPGRADE_AFTER_CREATE" && [ -n "$PENDING_UPGRADE_ID" ]; then
+        if load_pending_instance_state; then
+            invoke_upgrade_attempt
+            return $?
+        fi
+        log "Pending upgrade instance disappeared. Falling back to target instance check."
+        PENDING_UPGRADE_ID=""
+        PENDING_UPGRADE_REGION=""
+    fi
+
     should_check=0
-    if [ "$ATTEMPT" -eq 1 ] || [ "$VALIDATE_ONLY" = "1" ]; then
+    if [ "$ATTEMPT" -eq 1 ] || [ "$VALIDATE_ONLY" = "1" ] || [ "$FORCE_NEXT_EXISTING_CHECK" = "1" ]; then
         should_check=1
     elif [ "$EXISTING_CHECK_EVERY_ATTEMPTS" -gt 0 ] && [ $(((ATTEMPT - 1) % EXISTING_CHECK_EVERY_ATTEMPTS)) -eq 0 ]; then
         should_check=1
@@ -516,6 +587,7 @@ invoke_create_attempt() {
 
     if [ "$should_check" -eq 1 ]; then
         load_target_state
+        FORCE_NEXT_EXISTING_CHECK=0
     else
         LAST_INSTANCE_COUNT=0
         LAST_INSTANCES_FILE=""
@@ -532,9 +604,18 @@ invoke_create_attempt() {
         return 0
     fi
 
+    if [ "$should_check" -eq 1 ] && target_overflow; then
+        return 1
+    fi
+
     if [ "$should_check" -eq 1 ] && is_true "$UPGRADE_AFTER_CREATE" && [ "$LAST_INSTANCE_COUNT" -ge "$TARGET_INSTANCE_COUNT" ]; then
         invoke_upgrade_attempt
         return $?
+    fi
+
+    if ! is_true "$CREATE_IF_MISSING"; then
+        log "Create disabled by CREATE_IF_MISSING=false. Waiting for an existing target instance to upgrade."
+        return 1
     fi
 
     target="$(build_regions | while IFS= read -r region; do resolve_region_target "$region" && break; done | head -n 1)"
@@ -584,10 +665,13 @@ invoke_create_attempt() {
     if [ "$exit_code" -eq 0 ] && printf '%s' "$result" | grep -q "ocid1.instance"; then
         log "Create request succeeded: $create_name"
         printf '%s\n' "$result" >> "$LOG_FILE"
-        load_target_state
-        if [ "$LAST_INSTANCE_COUNT" -ge "$TARGET_INSTANCE_COUNT" ] && is_true "$UPGRADE_AFTER_CREATE"; then
-            invoke_upgrade_attempt || true
+        PENDING_UPGRADE_ID="$(printf '%s' "$result" | json_field "data.id" "")"
+        PENDING_UPGRADE_REGION="$region"
+        if [ -n "$PENDING_UPGRADE_ID" ] && load_pending_instance_state && is_true "$UPGRADE_AFTER_CREATE"; then
+            invoke_upgrade_attempt
+            return $?
         else
+            load_target_state
             write_success_flag_if_reached || true
         fi
         return 0
@@ -716,6 +800,10 @@ while [ ! -f "$SUCCESS_FLAG" ]; do
     echo "Attempt $ATTEMPT at $(date '+%Y-%m-%d %H:%M:%S %z')"
     result_code=0
     invoke_create_attempt || result_code=$?
+    if [ "$result_code" -eq 3 ]; then
+        FORCE_NEXT_EXISTING_CHECK=1
+        log "Timeout result detected. Forcing target instance check before the next launch attempt."
+    fi
 
     if [ "$VALIDATE_ONLY" = "1" ] || [ -f "$SUCCESS_FLAG" ]; then
         exit "$result_code"
