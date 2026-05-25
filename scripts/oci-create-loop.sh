@@ -579,7 +579,7 @@ invoke_create_attempt() {
     fi
 
     should_check=0
-    if [ "$ATTEMPT" -eq 1 ] || [ "$VALIDATE_ONLY" = "1" ] || [ "$FORCE_NEXT_EXISTING_CHECK" = "1" ]; then
+    if [ "$ATTEMPT" -eq 1 ] || [ "$VALIDATE_ONLY" = "1" ] || [ "$FORCE_NEXT_EXISTING_CHECK" = "1" ] || ! is_true "$CREATE_IF_MISSING"; then
         should_check=1
     elif [ "$EXISTING_CHECK_EVERY_ATTEMPTS" -gt 0 ] && [ $(((ATTEMPT - 1) % EXISTING_CHECK_EVERY_ATTEMPTS)) -eq 0 ]; then
         should_check=1

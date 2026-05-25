@@ -494,6 +494,10 @@ function Should-CheckExistingInstances {
         return $true
     }
 
+    if (-not $createIfMissing) {
+        return $true
+    }
+
     if ($existingCheckEveryAttempts -eq 0) {
         return $false
     }
