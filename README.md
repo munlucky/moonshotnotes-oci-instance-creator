@@ -4,36 +4,50 @@ Oracle Cloud Always Free A1 Flex 인스턴스를 CLI로 반복 생성하는 자�
 
 핵심 동작:
 
-- 기본 하한 `80초 + 0~10초 jitter` 간격으로 생성 시도
-- `429 TooManyRequests` 발생 시 `120초` 회복 sleep을 주고, 다음 non-429 응답 후 바로 `80초` 하한으로 복귀
-- `80초` 하한에서 25회 누적 시도하면 429 전에 선제적으로 `120초` 쿨다운
+- 기본 재시도 하한은 `80초 + 0~10초 jitter`
+- `429 TooManyRequests` 발생 시 `120초` 회복 sleep을 주고, 다음 non-429 응답 후 기본 하한으로 복귀
+- 기본 하한에서 25회 누적 시도하면 429 전에 선제적으로 `120초` 쿨다운
 - `Out of host capacity` / `500 InternalError`는 A1 자리 부족으로 보고 계속 재시도
 - 기존 인스턴스 조회는 시작 시 1회만 수행하고, 생성 성공 후에는 생성된 instance id로 upgrade만 재시도
 - 목표 수보다 많은 동일 prefix 인스턴스가 감지되면 추가 생성/업그레이드를 멈춰 중복 과금을 방지
 - `CREATE_IF_MISSING=false`로 전환하면 새 생성 없이 기존 인스턴스 upgrade만 수행
 - Windows/macOS/Linux 모두 단일 루프 lock을 잡아 PM2 중복 프로세스의 동시 생성 요청을 차단
 - `launch` 요청이 timeout처럼 성공 여부가 불명확하게 끝나면 다음 루프에서 강제로 기존 인스턴스를 재조회
-- `1 OCPU / 6GB`로 먼저 생성한 뒤 `2/12 -> 4/24` 순서로 resize 가능
-- 성공하면 success flag를 만들고 PM2가 다시 실행하지 않도록 정상 종료
+- `1 OCPU / 6GB`로 먼저 생성한 뒤 `2/12 -> 3/18 -> 4/24` 순서로 resize 가능
+- 성공하면 success flag를 만들고 PM2 dump에서 자기 항목을 제거해 재부팅 후에도 다시 실행되지 않도록 정상 종료
 
 ## 권장 전략
 
-Always Free A1은 `4 OCPU / 24GB`를 한 번에 확보하기 어렵습니다. 아래 전략을 권장합니다.
+Always Free A1은 `4 OCPU / 24GB`를 한 번에 확보하기 어렵습니다. 먼저 작은 인스턴스를 만든 뒤 같은 인스턴스를 단계적으로 resize하는 전략을 권장합니다.
 
 ```env
 OCPUS="1"
 MEMORY_GB="6"
 UPGRADE_AFTER_CREATE="true"
-UPGRADE_STEPS="2:12,4:24"
+UPGRADE_STEPS="2:12,3:18,4:24"
 ```
 
 동작 순서:
 
 1. `1 OCPU / 6GB` 인스턴스 생성
 2. 생성 성공 후 같은 인스턴스를 `2 OCPU / 12GB`로 resize
-3. 성공하면 `4 OCPU / 24GB`로 resize
-4. 목표 상태 확인 후 `SUCCESS_FLAG` 생성
-5. PM2 실행 중이면 exit code `0`으로 종료되어 재시작하지 않음
+3. 성공하면 `3 OCPU / 18GB`로 resize
+4. 성공하면 최종 `4 OCPU / 24GB`로 resize
+5. 목표 상태 확인 후 `SUCCESS_FLAG` 생성
+6. PM2 실행 중이면 exit code `0`으로 종료되고, PM2 dump에서 `oci-instance-creator` 항목을 제거해 재부팅 후에도 다시 실행되지 않음
+
+## 재시도 간격 기준
+
+기본값은 실제 운영 중 429 발생률과 시도 횟수의 균형을 보고 잡은 보수적 값입니다. 더 빠르게 시도하고 싶다면 `MIN_INTERVAL_SECONDS`를 낮출 수 있지만, 429가 늘어나면 전체 효율이 떨어질 수 있습니다.
+
+| env 키 | 기본값 | 설명 |
+| --- | --- | --- |
+| `INTERVAL_SECONDS` | `60` | throttle state가 없을 때 초기 interval |
+| `MIN_INTERVAL_SECONDS` | `80` | 일반 재시도 하한 |
+| `JITTER_SECONDS` | `10` | 매 sleep에 붙는 0~N초 무작위 지연 |
+| `RATE_LIMIT_BACKOFF_SECONDS` | `120` | 429 발생 후 회복 sleep 기준 |
+| `PROACTIVE_COOLDOWN_AFTER_MIN_ATTEMPTS` | `25` | 하한 interval에서 이 횟수만큼 시도하면 선제 쿨다운 |
+| `PROACTIVE_COOLDOWN_INTERVAL_SECONDS` | `120` | 선제 쿨다운 interval |
 
 ## 에러 의미
 
@@ -307,7 +321,7 @@ BOOT_VOLUME_GB="50"
 ASSIGN_PUBLIC_IP="true"
 
 UPGRADE_AFTER_CREATE="true"
-UPGRADE_STEPS="2:12,4:24"
+UPGRADE_STEPS="2:12,3:18,4:24"
 UPGRADE_OCPUS="4"
 UPGRADE_MEMORY_GB="24"
 
@@ -330,6 +344,8 @@ THROTTLE_STATE_FILE="$HOME/.oci-instance-throttle.json"
 
 DISCORD_WEBHOOK=""
 OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING="True"
+PM2_APP_NAME="oci-instance-creator"
+CLEANUP_PM2_DUMP_ON_SUCCESS="true"
 ```
 
 Windows에서도 위처럼 `$HOME/...` 경로를 쓰면 PowerShell 스크립트가 현재 사용자 홈 경로로 치환합니다.
@@ -463,7 +479,9 @@ tail -n 80 ~/oci-instance.log
 pm2 stop oci-instance-creator
 ```
 
-성공 후에는 `SUCCESS_FLAG` 파일이 생기고 스크립트가 exit code `0`으로 종료됩니다. `ecosystem.config.cjs`는 `stop_exit_codes: [0]`을 사용하므로 성공 종료 후 PM2가 다시 실행하지 않습니다.
+성공 후에는 `SUCCESS_FLAG` 파일이 생기고 스크립트가 exit code `0`으로 종료됩니다. `ecosystem.config.cjs`는 `stop_exit_codes: [0]`을 사용하므로 성공 종료 후 PM2가 즉시 재시작하지 않습니다.
+
+PM2로 실행한 경우 `scripts/pm2-oci-runner.cjs`가 성공 종료 시 `PM2_HOME/dump.pm2`에서 `oci-instance-creator` 항목도 제거합니다. 그래서 `pm2 resurrect`, Windows 시작 프로그램, 재부팅 복구가 실행되어도 OCI 자동화는 다시 올라오지 않습니다. 이 동작을 끄려면 env에 `CLEANUP_PM2_DUMP_ON_SUCCESS="false"`를 설정합니다.
 
 ## 11. throttle / success flag 초기화
 

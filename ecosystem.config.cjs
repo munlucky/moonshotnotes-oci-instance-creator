@@ -21,6 +21,8 @@ module.exports = {
       time: true,
       env: {
         OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True",
+        PM2_APP_NAME: "oci-instance-creator",
+        CLEANUP_PM2_DUMP_ON_SUCCESS: "true",
       },
     },
   ],
